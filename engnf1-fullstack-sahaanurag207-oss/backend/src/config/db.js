@@ -1,11 +1,11 @@
-import pg from 'pg';
+import mysql from 'mysql2/promise';
 import { env } from './env.js';
 
-const { Pool } = pg;
-
-export const pool = new Pool({
-  connectionString: env.databaseUrl,
-  ssl: env.databaseUrl?.includes('localhost') ? false : { rejectUnauthorized: false },
-  max: 25,
-  idleTimeoutMillis: 30000
+export const pool = mysql.createPool({
+  uri: env.databaseUrl,
+  waitForConnections: true,
+  connectionLimit: 25,
+  queueLimit: 0,
+  timezone: 'Z',
+  multipleStatements: true
 });

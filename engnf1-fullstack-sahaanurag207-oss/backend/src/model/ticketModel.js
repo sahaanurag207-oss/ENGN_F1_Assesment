@@ -1,4 +1,5 @@
-import { query } from '../database/dbHelper.js';
+import crypto from 'crypto';
+import { query, fromMysqlUtc } from '../database/dbHelper.js';
 import { escapeLikeWildcards } from '../utils/classifier.js';
 
 export const mapTicket = (r) => ({
@@ -8,13 +9,13 @@ export const mapTicket = (r) => ({
   body: r.body,
   autoCategory: r.auto_category,
   category: r.category,
-  isHumanOverride: r.is_human_override,
+  isHumanOverride: Boolean(r.is_human_override),
   priority: r.priority,
   status: r.status,
   assigneeId: r.assignee_id,
-  isReviewed: r.is_reviewed,
-  createdAt: r.created_at,
-  updatedAt: r.updated_at
+  isReviewed: Boolean(r.is_reviewed),
+  createdAt: fromMysqlUtc(r.created_at),
+  updatedAt: fromMysqlUtc(r.updated_at)
 });
 
 export const mapEvent = (r) => ({
@@ -24,38 +25,42 @@ export const mapEvent = (r) => ({
   oldValue: r.old_value,
   newValue: r.new_value,
   actor: r.actor,
-  createdAt: r.created_at
+  createdAt: fromMysqlUtc(r.created_at)
 });
 
 export const ticketModel = {
-  async findByExternalId(externalId, client = null) {
-    const exec = client ? client.query.bind(client) : query;
-    const res = await exec('SELECT * FROM tickets WHERE external_id = $1 FOR UPDATE', [externalId]);
-    return res.rows[0] || null;
+  async findByExternalId(externalId, conn = null) {
+    if (conn) {
+      const [rows] = await conn.execute('SELECT * FROM tickets WHERE external_id = ? FOR UPDATE', [externalId]);
+      return rows[0] || null;
+    }
+    const rows = await query('SELECT * FROM tickets WHERE external_id = ? LIMIT 1', [externalId]);
+    return rows[0] || null;
   },
 
-  async insertTicket({ externalId, subject, body, autoCategory, priority }, client) {
-    const res = await client.query(
-      `INSERT INTO tickets (external_id, subject, body, auto_category, category, priority)
-       VALUES ($1, $2, $3, $4, $4, $5)
-       RETURNING *`,
-      [externalId, subject, body, autoCategory, priority]
+  async insertTicket({ externalId, subject, body, autoCategory, priority }, conn) {
+    const id = crypto.randomUUID();
+    await conn.execute(
+      `INSERT INTO tickets (id, external_id, subject, body, auto_category, category, priority)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, externalId, subject, body, autoCategory, autoCategory, priority]
     );
-    return mapTicket(res.rows[0]);
+    const [rows] = await conn.execute('SELECT * FROM tickets WHERE id = ?', [id]);
+    return mapTicket(rows[0]);
   },
 
-  async updateFromImport(id, { subject, body, autoCategory, priority, preserveCategory }, client) {
+  async updateFromImport(id, { subject, body, autoCategory, priority, preserveCategory }, conn) {
     if (preserveCategory) {
-      await client.query(
-        `UPDATE tickets SET subject = $1, body = $2, updated_at = NOW() WHERE id = $3`,
+      await conn.execute(
+        `UPDATE tickets SET subject = ?, body = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
         [subject, body, id]
       );
     } else {
-      await client.query(
+      await conn.execute(
         `UPDATE tickets
-         SET subject = $1, body = $2, auto_category = $3, category = $3, priority = $4, updated_at = NOW()
-         WHERE id = $5`,
-        [subject, body, autoCategory, priority, id]
+         SET subject = ?, body = ?, auto_category = ?, category = ?, priority = ?, updated_at = CURRENT_TIMESTAMP(3)
+         WHERE id = ?`,
+        [subject, body, autoCategory, autoCategory, priority, id]
       );
     }
   },
@@ -65,99 +70,109 @@ export const ticketModel = {
     const params = [];
 
     if (status) {
+      conditions.push('status = ?');
       params.push(status);
-      conditions.push(`status = $${params.length}`);
     }
     if (category) {
+      conditions.push('category = ?');
       params.push(category);
-      conditions.push(`category = $${params.length}`);
     }
     if (priority) {
+      conditions.push('priority = ?');
       params.push(priority);
-      conditions.push(`priority = $${params.length}`);
     }
     if (q && q.trim().length > 0) {
-      params.push(`%${escapeLikeWildcards(q.trim())}%`);
-      conditions.push(`(subject ILIKE $${params.length} ESCAPE '\\' OR body ILIKE $${params.length} ESCAPE '\\')`);
+      const pattern = `%${escapeLikeWildcards(q.trim())}%`;
+      conditions.push(`(LOWER(subject) LIKE LOWER(?) ESCAPE '\\' OR LOWER(body) LIKE LOWER(?) ESCAPE '\\')`);
+      params.push(pattern, pattern);
     }
 
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const countRes = await query(`SELECT COUNT(*)::int AS total FROM tickets ${whereClause}`, params);
-    const total = countRes.rows[0].total;
+    const countRows = await query(`SELECT COUNT(*) AS total FROM tickets ${whereClause}`, params);
+    const total = Number(countRows[0].total);
 
-    const offset = (page - 1) * limit;
-    params.push(limit, offset);
-    const dataRes = await query(
+    const safeLimit = Number(limit);
+    const safeOffset = (Number(page) - 1) * safeLimit;
+    const dataRows = await query(
       `SELECT * FROM tickets ${whereClause}
        ORDER BY created_at DESC, id ASC
-       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+       LIMIT ${safeLimit} OFFSET ${safeOffset}`,
       params
     );
 
     return {
-      data: dataRes.rows.map(mapTicket),
-      page,
-      pageSize: limit,
+      data: dataRows.map(mapTicket),
+      page: Number(page),
+      pageSize: safeLimit,
       total,
-      totalPages: Math.ceil(total / limit)
+      totalPages: Math.ceil(total / safeLimit)
     };
   },
 
-  async findByIdWithEvents(id, client = null) {
-    const exec = client ? client.query.bind(client) : query;
-    const tRes = await exec('SELECT * FROM tickets WHERE id = $1', [id]);
-    if (!tRes.rows[0]) return null;
-    const eRes = await exec('SELECT * FROM ticket_events WHERE ticket_id = $1 ORDER BY created_at ASC', [id]);
+  async findByIdWithEvents(id, conn = null) {
+    let tRows;
+    let eRows;
+    if (conn) {
+      [tRows] = await conn.execute('SELECT * FROM tickets WHERE id = ?', [id]);
+      if (!tRows[0]) return null;
+      [eRows] = await conn.execute('SELECT * FROM ticket_events WHERE ticket_id = ? ORDER BY created_at ASC', [id]);
+    } else {
+      tRows = await query('SELECT * FROM tickets WHERE id = ?', [id]);
+      if (!tRows[0]) return null;
+      eRows = await query('SELECT * FROM ticket_events WHERE ticket_id = ? ORDER BY created_at ASC', [id]);
+    }
     return {
-      ticket: mapTicket(tRes.rows[0]),
-      events: eRes.rows.map(mapEvent)
+      ticket: mapTicket(tRows[0]),
+      events: eRows.map(mapEvent)
     };
   },
 
   async getStats() {
-    const res = await query(`
+    const rows = await query(`
       SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE is_reviewed = TRUE)::int AS reviewed_count,
-        COUNT(*) FILTER (WHERE category = auto_category)::int AS agreed_count,
-        COUNT(*) FILTER (WHERE category = 'BILLING')::int AS cat_billing,
-        COUNT(*) FILTER (WHERE category = 'BUG')::int AS cat_bug,
-        COUNT(*) FILTER (WHERE category = 'FEATURE_REQUEST')::int AS cat_feature,
-        COUNT(*) FILTER (WHERE category = 'LOGIN')::int AS cat_login,
-        COUNT(*) FILTER (WHERE category = 'DELIVERY')::int AS cat_delivery,
-        COUNT(*) FILTER (WHERE priority = 'LOW')::int AS pri_low,
-        COUNT(*) FILTER (WHERE priority = 'MEDIUM')::int AS pri_medium,
-        COUNT(*) FILTER (WHERE priority = 'HIGH')::int AS pri_high,
-        COUNT(*) FILTER (WHERE priority = 'URGENT')::int AS pri_urgent,
-        COUNT(*) FILTER (WHERE status = 'OPEN')::int AS st_open,
-        COUNT(*) FILTER (WHERE status = 'IN_PROGRESS')::int AS st_in_progress,
-        COUNT(*) FILTER (WHERE status = 'RESOLVED')::int AS st_resolved,
-        COUNT(*) FILTER (WHERE status = 'CLOSED')::int AS st_closed
+        COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN is_reviewed = 1 THEN 1 ELSE 0 END), 0) AS reviewed_count,
+        COALESCE(SUM(CASE WHEN category = auto_category THEN 1 ELSE 0 END), 0) AS agreed_count,
+        COALESCE(SUM(CASE WHEN category = 'BILLING' THEN 1 ELSE 0 END), 0) AS cat_billing,
+        COALESCE(SUM(CASE WHEN category = 'BUG' THEN 1 ELSE 0 END), 0) AS cat_bug,
+        COALESCE(SUM(CASE WHEN category = 'FEATURE_REQUEST' THEN 1 ELSE 0 END), 0) AS cat_feature,
+        COALESCE(SUM(CASE WHEN category = 'LOGIN' THEN 1 ELSE 0 END), 0) AS cat_login,
+        COALESCE(SUM(CASE WHEN category = 'DELIVERY' THEN 1 ELSE 0 END), 0) AS cat_delivery,
+        COALESCE(SUM(CASE WHEN priority = 'LOW' THEN 1 ELSE 0 END), 0) AS pri_low,
+        COALESCE(SUM(CASE WHEN priority = 'MEDIUM' THEN 1 ELSE 0 END), 0) AS pri_medium,
+        COALESCE(SUM(CASE WHEN priority = 'HIGH' THEN 1 ELSE 0 END), 0) AS pri_high,
+        COALESCE(SUM(CASE WHEN priority = 'URGENT' THEN 1 ELSE 0 END), 0) AS pri_urgent,
+        COALESCE(SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END), 0) AS st_open,
+        COALESCE(SUM(CASE WHEN status = 'IN_PROGRESS' THEN 1 ELSE 0 END), 0) AS st_in_progress,
+        COALESCE(SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END), 0) AS st_resolved,
+        COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END), 0) AS st_closed
       FROM tickets
     `);
-    const r = res.rows[0];
-    const agreement = r.total === 0 ? 100 : Number(((r.agreed_count / r.total) * 100).toFixed(2));
+    const r = rows[0];
+    const total = Number(r.total);
+    const agreed = Number(r.agreed_count);
+    const agreement = total === 0 ? 100 : Number(((agreed / total) * 100).toFixed(2));
     return {
       byCategory: {
-        BILLING: r.cat_billing,
-        BUG: r.cat_bug,
-        FEATURE_REQUEST: r.cat_feature,
-        LOGIN: r.cat_login,
-        DELIVERY: r.cat_delivery
+        BILLING: Number(r.cat_billing),
+        BUG: Number(r.cat_bug),
+        FEATURE_REQUEST: Number(r.cat_feature),
+        LOGIN: Number(r.cat_login),
+        DELIVERY: Number(r.cat_delivery)
       },
       byPriority: {
-        LOW: r.pri_low,
-        MEDIUM: r.pri_medium,
-        HIGH: r.pri_high,
-        URGENT: r.pri_urgent
+        LOW: Number(r.pri_low),
+        MEDIUM: Number(r.pri_medium),
+        HIGH: Number(r.pri_high),
+        URGENT: Number(r.pri_urgent)
       },
       byStatus: {
-        OPEN: r.st_open,
-        IN_PROGRESS: r.st_in_progress,
-        RESOLVED: r.st_resolved,
-        CLOSED: r.st_closed
+        OPEN: Number(r.st_open),
+        IN_PROGRESS: Number(r.st_in_progress),
+        RESOLVED: Number(r.st_resolved),
+        CLOSED: Number(r.st_closed)
       },
-      reviewedCount: r.reviewed_count,
+      reviewedCount: Number(r.reviewed_count),
       modelAgreementRate: agreement
     };
   }

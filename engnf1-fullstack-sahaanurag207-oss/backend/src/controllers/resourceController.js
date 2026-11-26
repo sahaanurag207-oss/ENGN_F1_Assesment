@@ -58,7 +58,7 @@ export const resourceController = {
       const resource = await resourceModel.create(payload);
       res.status(201).json(resource);
     } catch (err) {
-      if (err.code === '23505') {
+      if (err.code === 'ER_DUP_ENTRY') {
         return next(Errors.conflict('A resource with this name already exists'));
       }
       next(err);
@@ -73,7 +73,7 @@ export const resourceController = {
       if (!updated) throw Errors.notFound('Resource not found');
       res.status(200).json(updated);
     } catch (err) {
-      if (err.code === '23505') {
+      if (err.code === 'ER_DUP_ENTRY') {
         return next(Errors.conflict('A resource with this name already exists'));
       }
       next(err);

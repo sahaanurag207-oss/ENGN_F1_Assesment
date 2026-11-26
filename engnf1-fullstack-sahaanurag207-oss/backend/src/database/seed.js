@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { pool } from '../config/db.js';
 import { hashPassword } from '../utils/authUtils.js';
 import { classifyTicket } from '../utils/classifier.js';
@@ -33,53 +34,49 @@ async function seed() {
   const adminHash = await hashPassword('Admin@123');
   const userHash = await hashPassword('User@123');
 
-  await pool.query(
-    `INSERT INTO users (name, email, password_hash, role)
-     VALUES ('Admin Lead', 'admin@triagesync.test', $1, 'ADMIN')
-     ON CONFLICT ((LOWER(email))) DO NOTHING`,
-    [adminHash]
+  await pool.execute(
+    `INSERT IGNORE INTO users (id, name, email, password_hash, role)
+     VALUES (?, 'Admin Lead', 'admin@triagesync.test', ?, 'ADMIN')`,
+    [crypto.randomUUID(), adminHash]
   );
 
-  await pool.query(
-    `INSERT INTO users (name, email, password_hash, role)
-     VALUES ('Agent Demo', 'user@triagesync.test', $1, 'USER')
-     ON CONFLICT ((LOWER(email))) DO NOTHING`,
-    [userHash]
+  await pool.execute(
+    `INSERT IGNORE INTO users (id, name, email, password_hash, role)
+     VALUES (?, 'Agent Demo', 'user@triagesync.test', ?, 'USER')`,
+    [crypto.randomUUID(), userHash]
   );
 
   for (const r of RESOURCES) {
-    await pool.query(
-      `INSERT INTO resources (name, type, capacity, description, is_active)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT ((LOWER(name))) DO NOTHING`,
-      [r.name, r.type, r.capacity, r.description, r.isActive]
+    await pool.execute(
+      `INSERT IGNORE INTO resources (id, name, type, capacity, description, is_active)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [crypto.randomUUID(), r.name, r.type, r.capacity, r.description, r.isActive ? 1 : 0]
     );
   }
 
   for (const t of TICKETS) {
     const { autoCategory, priority } = classifyTicket(t.subject, t.body);
     const finalCat = t.overrideCat || autoCategory;
-    const isOverride = Boolean(t.overrideCat);
+    const isOverride = t.overrideCat ? 1 : 0;
     const status = t.status || 'OPEN';
+    const ticketId = crypto.randomUUID();
 
-    const res = await pool.query(
-      `INSERT INTO tickets (external_id, subject, body, auto_category, category, is_human_override, priority, status, is_reviewed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       ON CONFLICT (external_id) DO NOTHING
-       RETURNING id`,
-      [t.externalId, t.subject, t.body, autoCategory, finalCat, isOverride, priority, status, Boolean(t.reviewed)]
+    const [res] = await pool.execute(
+      `INSERT IGNORE INTO tickets (id, external_id, subject, body, auto_category, category, is_human_override, priority, status, is_reviewed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [ticketId, t.externalId, t.subject, t.body, autoCategory, finalCat, isOverride, priority, status, t.reviewed ? 1 : 0]
     );
 
-    if (res.rows[0] && t.reviewed) {
-      await pool.query(
-        `INSERT INTO ticket_events (ticket_id, field, old_value, new_value, actor)
-         VALUES ($1, 'status', 'OPEN', $2, 'admin@triagesync.test')`,
-        [res.rows[0].id, status]
+    if (res.affectedRows > 0 && t.reviewed) {
+      await pool.execute(
+        `INSERT INTO ticket_events (id, ticket_id, field, old_value, new_value, actor)
+         VALUES (?, ?, 'status', 'OPEN', ?, 'admin@triagesync.test')`,
+        [crypto.randomUUID(), ticketId, status]
       );
     }
   }
 
-  console.log('Idempotent seed completed successfully.');
+  console.log('MySQL idempotent seed completed successfully.');
   await pool.end();
 }
 

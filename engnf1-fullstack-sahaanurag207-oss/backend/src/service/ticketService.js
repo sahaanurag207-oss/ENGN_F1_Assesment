@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { withTransaction } from '../database/dbHelper.js';
 import { ticketModel } from '../model/ticketModel.js';
 import { userModel } from '../model/userModel.js';
@@ -6,13 +7,13 @@ import { Errors } from '../utils/AppError.js';
 
 export const ticketService = {
   async importFeed(tickets) {
-    return withTransaction(async (client) => {
+    return withTransaction(async (conn) => {
       let importedCount = 0;
       let updatedCount = 0;
       let skippedOverrideCount = 0;
 
       for (const item of tickets) {
-        const existing = await ticketModel.findByExternalId(item.externalId, client);
+        const existing = await ticketModel.findByExternalId(item.externalId, conn);
         const { autoCategory, priority } = classifyTicket(item.subject, item.body);
 
         if (!existing) {
@@ -24,7 +25,7 @@ export const ticketService = {
               autoCategory,
               priority
             },
-            client
+            conn
           );
           importedCount++;
         } else if (existing.is_human_override) {
@@ -35,7 +36,7 @@ export const ticketService = {
               body: item.body,
               preserveCategory: true
             },
-            client
+            conn
           );
           skippedOverrideCount++;
         } else {
@@ -48,7 +49,7 @@ export const ticketService = {
               priority,
               preserveCategory: false
             },
-            client
+            conn
           );
           updatedCount++;
         }
@@ -64,9 +65,9 @@ export const ticketService = {
   },
 
   async reviewTicket(ticketId, patch, actor) {
-    return withTransaction(async (client) => {
-      const currentRes = await client.query('SELECT * FROM tickets WHERE id = $1 FOR UPDATE', [ticketId]);
-      const current = currentRes.rows[0];
+    return withTransaction(async (conn) => {
+      const [currentRows] = await conn.execute('SELECT * FROM tickets WHERE id = ? FOR UPDATE', [ticketId]);
+      const current = currentRows[0];
       if (!current) {
         throw Errors.notFound('Ticket not found');
       }
@@ -80,11 +81,11 @@ export const ticketService = {
 
       const changes = [];
       let nextCategory = current.category;
-      let nextOverride = current.is_human_override;
+      let nextOverride = Boolean(current.is_human_override);
       let nextPriority = current.priority;
       let nextStatus = current.status;
       let nextAssignee = current.assignee_id;
-      let nextReviewed = current.is_reviewed;
+      let nextReviewed = Boolean(current.is_reviewed);
 
       if (patch.category !== undefined && patch.category !== current.category) {
         changes.push({ field: 'category', oldValue: current.category, newValue: patch.category });
@@ -112,29 +113,37 @@ export const ticketService = {
       }
 
       if (changes.length > 0) {
-        await client.query(
+        await conn.execute(
           `UPDATE tickets
-           SET category = $1,
-               is_human_override = $2,
-               priority = $3,
-               status = $4,
-               assignee_id = $5,
-               is_reviewed = $6,
-               updated_at = NOW()
-           WHERE id = $7`,
-          [nextCategory, nextOverride, nextPriority, nextStatus, nextAssignee, nextReviewed, ticketId]
+           SET category = ?,
+               is_human_override = ?,
+               priority = ?,
+               status = ?,
+               assignee_id = ?,
+               is_reviewed = ?,
+               updated_at = CURRENT_TIMESTAMP(3)
+           WHERE id = ?`,
+          [
+            nextCategory,
+            nextOverride ? 1 : 0,
+            nextPriority,
+            nextStatus,
+            nextAssignee,
+            nextReviewed ? 1 : 0,
+            ticketId
+          ]
         );
 
         for (const ch of changes) {
-          await client.query(
-            `INSERT INTO ticket_events (ticket_id, field, old_value, new_value, actor)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [ticketId, ch.field, ch.oldValue, ch.newValue, actor]
+          await conn.execute(
+            `INSERT INTO ticket_events (id, ticket_id, field, old_value, new_value, actor)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [crypto.randomUUID(), ticketId, ch.field, ch.oldValue, ch.newValue, actor]
           );
         }
       }
 
-      return ticketModel.findByIdWithEvents(ticketId, client);
+      return ticketModel.findByIdWithEvents(ticketId, conn);
     });
   }
 };

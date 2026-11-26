@@ -1,14 +1,17 @@
-import { withTransaction } from '../database/dbHelper.js';
+import crypto from 'crypto';
+import { withTransaction, toMysqlUtc } from '../database/dbHelper.js';
 import { mapBooking } from '../model/bookingModel.js';
 import { Errors } from '../utils/AppError.js';
 
 export const bookingService = {
   async createBooking({ userId, resourceId, ticketId, startTime, endTime, purpose }) {
-    return withTransaction(async (client) => {
-      await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    return withTransaction(async (conn) => {
+      // Lock user row to serialize concurrent max-3 quota check
+      await conn.execute('SELECT id FROM users WHERE id = ? FOR UPDATE', [userId]);
 
-      const resRow = await client.query('SELECT * FROM resources WHERE id = $1 FOR UPDATE', [resourceId]);
-      const resource = resRow.rows[0];
+      // Lock resource row to serialize all concurrent slot checks on this resource
+      const [resRows] = await conn.execute('SELECT * FROM resources WHERE id = ? FOR UPDATE', [resourceId]);
+      const resource = resRows[0];
       if (!resource) {
         throw Errors.notFound('Resource not found');
       }
@@ -17,94 +20,90 @@ export const bookingService = {
       }
 
       if (ticketId) {
-        const tRow = await client.query('SELECT id FROM tickets WHERE id = $1', [ticketId]);
-        if (!tRow.rows[0]) {
+        const [tRows] = await conn.execute('SELECT id FROM tickets WHERE id = ?', [ticketId]);
+        if (!tRows[0]) {
           throw Errors.notFound('Referenced ticket not found');
         }
       }
 
-      const countRes = await client.query(
-        `SELECT COUNT(*)::int AS active_count
+      const [countRows] = await conn.execute(
+        `SELECT COUNT(*) AS active_count
          FROM bookings
-         WHERE user_id = $1
+         WHERE user_id = ?
            AND status IN ('PENDING', 'APPROVED')
-           AND start_time > NOW()`,
+           AND start_time > UTC_TIMESTAMP(3)`,
         [userId]
       );
-      if (countRes.rows[0].active_count >= 3) {
+      if (Number(countRows[0].active_count) >= 3) {
         throw Errors.conflict('Maximum of 3 future PENDING or APPROVED bookings allowed per user');
       }
 
-      const overlapRes = await client.query(
+      const startSql = toMysqlUtc(startTime);
+      const endSql = toMysqlUtc(endTime);
+
+      const [overlapRows] = await conn.execute(
         `SELECT id FROM bookings
-         WHERE resource_id = $1
+         WHERE resource_id = ?
            AND status IN ('PENDING', 'APPROVED')
-           AND start_time < $3::timestamptz
-           AND end_time > $2::timestamptz
+           AND start_time < ?
+           AND end_time > ?
          LIMIT 1`,
-        [resourceId, startTime, endTime]
+        [resourceId, endSql, startSql]
       );
-      if (overlapRes.rows.length > 0) {
+      if (overlapRows.length > 0) {
         throw Errors.conflict('Selected time slot overlaps with an existing booking');
       }
 
-      try {
-        const insertRes = await client.query(
-          `INSERT INTO bookings (resource_id, user_id, ticket_id, start_time, end_time, purpose, status)
-           VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
-           RETURNING *`,
-          [resourceId, userId, ticketId, startTime, endTime, purpose]
-        );
-        return mapBooking(insertRes.rows[0]);
-      } catch (err) {
-        if (err.code === '23P01') {
-          throw Errors.conflict('Selected time slot was just claimed by another request');
-        }
-        throw err;
-      }
+      const id = crypto.randomUUID();
+      await conn.execute(
+        `INSERT INTO bookings (id, resource_id, user_id, ticket_id, start_time, end_time, purpose, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+        [id, resourceId, userId, ticketId, startSql, endSql, purpose]
+      );
+
+      const [insertedRows] = await conn.execute('SELECT * FROM bookings WHERE id = ?', [id]);
+      return mapBooking(insertedRows[0]);
     });
   },
 
   async cancelBooking(bookingId, requester) {
-    return withTransaction(async (client) => {
-      const res = await client.query('SELECT * FROM bookings WHERE id = $1 FOR UPDATE', [bookingId]);
-      const booking = res.rows[0];
+    return withTransaction(async (conn) => {
+      const [rows] = await conn.execute('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [bookingId]);
+      const booking = rows[0];
       if (!booking) throw Errors.notFound('Booking not found');
       if (booking.user_id !== requester.id) throw Errors.forbidden('Only the booking owner can cancel');
 
       if (!['PENDING', 'APPROVED'].includes(booking.status)) {
         throw Errors.conflict(`Cannot cancel booking in ${booking.status} status`);
       }
-      if (new Date(booking.start_time).getTime() <= Date.now()) {
+      const startMs = new Date(`${String(booking.start_time).replace(' ', 'T')}Z`).getTime();
+      if (startMs <= Date.now()) {
         throw Errors.conflict('Cannot cancel a booking that has already started');
       }
 
-      const upd = await client.query(
-        `UPDATE bookings SET status = 'CANCELLED' WHERE id = $1 RETURNING *`,
-        [bookingId]
-      );
-      return mapBooking(upd.rows[0]);
+      await conn.execute(`UPDATE bookings SET status = 'CANCELLED' WHERE id = ?`, [bookingId]);
+      const [upd] = await conn.execute('SELECT * FROM bookings WHERE id = ?', [bookingId]);
+      return mapBooking(upd[0]);
     });
   },
 
   async approveBooking(bookingId) {
-    return withTransaction(async (client) => {
-      const res = await client.query('SELECT * FROM bookings WHERE id = $1 FOR UPDATE', [bookingId]);
-      const booking = res.rows[0];
+    return withTransaction(async (conn) => {
+      const [rows] = await conn.execute('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [bookingId]);
+      const booking = rows[0];
       if (!booking) throw Errors.notFound('Booking not found');
 
       if (booking.status !== 'PENDING') {
         throw Errors.conflict(`Cannot approve booking in ${booking.status} status`);
       }
-      if (new Date(booking.start_time).getTime() <= Date.now()) {
+      const startMs = new Date(`${String(booking.start_time).replace(' ', 'T')}Z`).getTime();
+      if (startMs <= Date.now()) {
         throw Errors.conflict('Cannot approve a booking whose startTime is in the past');
       }
 
-      const upd = await client.query(
-        `UPDATE bookings SET status = 'APPROVED' WHERE id = $1 RETURNING *`,
-        [bookingId]
-      );
-      return mapBooking(upd.rows[0]);
+      await conn.execute(`UPDATE bookings SET status = 'APPROVED' WHERE id = ?`, [bookingId]);
+      const [upd] = await conn.execute('SELECT * FROM bookings WHERE id = ?', [bookingId]);
+      return mapBooking(upd[0]);
     });
   },
 
@@ -114,23 +113,22 @@ export const bookingService = {
       throw Errors.validation('Rejection note is required (5-200 characters)');
     }
 
-    return withTransaction(async (client) => {
-      const res = await client.query('SELECT * FROM bookings WHERE id = $1 FOR UPDATE', [bookingId]);
-      const booking = res.rows[0];
+    return withTransaction(async (conn) => {
+      const [rows] = await conn.execute('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [bookingId]);
+      const booking = rows[0];
       if (!booking) throw Errors.notFound('Booking not found');
 
       if (booking.status !== 'PENDING') {
         throw Errors.conflict(`Cannot reject booking in ${booking.status} status`);
       }
-      if (new Date(booking.start_time).getTime() <= Date.now()) {
+      const startMs = new Date(`${String(booking.start_time).replace(' ', 'T')}Z`).getTime();
+      if (startMs <= Date.now()) {
         throw Errors.conflict('Cannot reject a booking whose startTime is in the past');
       }
 
-      const upd = await client.query(
-        `UPDATE bookings SET status = 'REJECTED', decision_note = $2 WHERE id = $1 RETURNING *`,
-        [bookingId, cleanNote]
-      );
-      return mapBooking(upd.rows[0]);
+      await conn.execute(`UPDATE bookings SET status = 'REJECTED', decision_note = ? WHERE id = ?`, [cleanNote, bookingId]);
+      const [upd] = await conn.execute('SELECT * FROM bookings WHERE id = ?', [bookingId]);
+      return mapBooking(upd[0]);
     });
   }
 };

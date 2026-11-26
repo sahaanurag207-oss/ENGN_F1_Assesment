@@ -1,14 +1,15 @@
-import { query } from '../database/dbHelper.js';
+import crypto from 'crypto';
+import { query, fromMysqlUtc } from '../database/dbHelper.js';
 import { escapeLikeWildcards } from '../utils/classifier.js';
 
 export const mapResource = (r) => ({
   id: r.id,
   name: r.name,
   type: r.type,
-  capacity: r.capacity,
+  capacity: Number(r.capacity),
   description: r.description,
-  isActive: r.is_active,
-  createdAt: r.created_at
+  isActive: Boolean(r.is_active),
+  createdAt: fromMysqlUtc(r.created_at)
 });
 
 export const resourceModel = {
@@ -17,54 +18,55 @@ export const resourceModel = {
     const params = [];
 
     if (!includeInactive) {
-      conditions.push('is_active = TRUE');
+      conditions.push('is_active = 1');
     }
     if (search && search.trim()) {
-      params.push(`%${escapeLikeWildcards(search.trim())}%`);
-      conditions.push(`(name ILIKE $${params.length} ESCAPE '\\' OR COALESCE(description, '') ILIKE $${params.length} ESCAPE '\\')`);
+      const pattern = `%${escapeLikeWildcards(search.trim())}%`;
+      conditions.push(`(LOWER(name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE LOWER(?) ESCAPE '\\')`);
+      params.push(pattern, pattern);
     }
     if (type) {
+      conditions.push('type = ?');
       params.push(type);
-      conditions.push(`type = $${params.length}`);
     }
     if (minCapacity !== undefined) {
-      params.push(minCapacity);
-      conditions.push(`capacity >= $${params.length}`);
+      conditions.push('capacity >= ?');
+      params.push(Number(minCapacity));
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const countRes = await query(`SELECT COUNT(*)::int AS total FROM resources ${where}`, params);
-    const total = countRes.rows[0].total;
+    const countRows = await query(`SELECT COUNT(*) AS total FROM resources ${where}`, params);
+    const total = Number(countRows[0].total);
 
-    const offset = (page - 1) * pageSize;
-    params.push(pageSize, offset);
-    const rowsRes = await query(
-      `SELECT * FROM resources ${where} ORDER BY LOWER(name) ASC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    const safeLimit = Number(pageSize);
+    const safeOffset = (Number(page) - 1) * safeLimit;
+    const rows = await query(
+      `SELECT * FROM resources ${where} ORDER BY LOWER(name) ASC LIMIT ${safeLimit} OFFSET ${safeOffset}`,
       params
     );
 
     return {
-      data: rowsRes.rows.map(mapResource),
-      page,
-      pageSize,
+      data: rows.map(mapResource),
+      page: Number(page),
+      pageSize: safeLimit,
       total,
-      totalPages: Math.ceil(total / pageSize)
+      totalPages: Math.ceil(total / safeLimit)
     };
   },
 
   async findById(id) {
-    const res = await query('SELECT * FROM resources WHERE id = $1', [id]);
-    return res.rows[0] ? mapResource(res.rows[0]) : null;
+    const rows = await query('SELECT * FROM resources WHERE id = ? LIMIT 1', [id]);
+    return rows[0] ? mapResource(rows[0]) : null;
   },
 
   async create({ name, type, capacity, description = null }) {
-    const res = await query(
-      `INSERT INTO resources (name, type, capacity, description)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [name, type, capacity, description]
+    const id = crypto.randomUUID();
+    await query(
+      `INSERT INTO resources (id, name, type, capacity, description)
+       VALUES (?, ?, ?, ?, ?)`,
+      [id, name, type, capacity, description]
     );
-    return mapResource(res.rows[0]);
+    return this.findById(id);
   },
 
   async update(id, fields) {
@@ -72,31 +74,28 @@ export const resourceModel = {
     const params = [];
 
     if (fields.name !== undefined) {
+      sets.push('name = ?');
       params.push(fields.name);
-      sets.push(`name = $${params.length}`);
     }
     if (fields.type !== undefined) {
+      sets.push('type = ?');
       params.push(fields.type);
-      sets.push(`type = $${params.length}`);
     }
     if (fields.capacity !== undefined) {
+      sets.push('capacity = ?');
       params.push(fields.capacity);
-      sets.push(`capacity = $${params.length}`);
     }
     if (fields.description !== undefined) {
+      sets.push('description = ?');
       params.push(fields.description);
-      sets.push(`description = $${params.length}`);
     }
     if (fields.isActive !== undefined) {
-      params.push(fields.isActive);
-      sets.push(`is_active = $${params.length}`);
+      sets.push('is_active = ?');
+      params.push(fields.isActive ? 1 : 0);
     }
 
     params.push(id);
-    const res = await query(
-      `UPDATE resources SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
-      params
-    );
-    return res.rows[0] ? mapResource(res.rows[0]) : null;
+    await query(`UPDATE resources SET ${sets.join(', ')} WHERE id = ?`, params);
+    return this.findById(id);
   }
 };
